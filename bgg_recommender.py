@@ -1,4 +1,6 @@
 import os
+from random import shuffle
+from turtle import forward
 
 import pandas as pd
 import numpy as np
@@ -9,8 +11,11 @@ from torch.nn import Linear
 
 from torch_geometric.data import HeteroData
 import torch_geometric.transforms as T
-from torch_geometric.nn import SAGEConv, to_hetero
+from torch_geometric.nn import GraphConv, to_hetero, GAE, HeteroConv
 from torch_geometric.loader import LinkNeighborLoader
+from torch_geometric.utils import train_test_split_edges
+
+from torch_sparse import SparseTensor
 
 from tqdm import tqdm
 
@@ -142,140 +147,142 @@ def main():
     data['user', 'rating', 'game'].edge_index = edge_index
     data['user', 'rating', 'game'].edge_attr = torch.flatten(edge_attr)
     data.edge_index = edge_index
-    data.edge_attr = torch.flatten(edge_attr)
+    data.edge_weight = torch.flatten(edge_attr)
+    data.edge_weight_dict = {('user', 'rating', 'game'): torch.flatten(edge_attr)}
 
     device = torch.device('mps')
-    batch_size = 15000
+    batch_size = 32000
     data.batch_size = batch_size
-
-    #need to deal with this, use a small learnable embedding instead? id like to use mps with sparse matrices (not implemented)
-    #as hack use ones vector? 
-    #if use just eye its too big for gpu and cpu
-    #why doesnt cpu and sparse work?? weird error
-    #'NotImplementedError: Could not run 'aten::scatter_add.out' with arguments from the 'SparseCPU' backend.' but SparseCPU in list
-    #data['user'].x = torch.eye(data['user'].num_nodes) 
-    #data['user'].x = sparse_eye(data['user'].num_nodes) #try different sparse id matrix?
-    #data['user'].x = torch.nn.Embedding(len(user_mapping), 32)
-    
-    
-    data['user'].x = torch.unsqueeze(torch.ones(data['user'].num_nodes), dim=-1) #TODO: TRY APPLYING AFTER BATCHING
 
     data['user'].num_nodes = torch.tensor(len(user_mapping)) 
     data['game'].num_nodes = torch.tensor(len(game_mapping))
 
-    #data['user'].x_dict = {'user': torch.nn.Embedding(data['user'].num_nodes, dim_embd)}
-    #data.x_dict = torch.nn.ModuleDict({'user': torch.nn.Embedding(data['user'].num_nodes, dim_embd), 
-                                        #'game': torch.nn.Embedding(data['game'].num_nodes, dim_embd)})
+    data['user'].node_id = torch.arange(len(user_mapping))
+    data['game'].node_id = torch.arange(len(game_mapping))
 
 
     data.edge_types = [('user', 'rating', 'game')]
     data = T.ToUndirected()(data)
-    del data['game', 'rev_rating', 'user'].edge_label
-    del data['game', 'rev_rating', 'user'].edge_label_index
 
-    torch.manual_seed(9)
+    torch.manual_seed(79)
  
-    split_trans = T.RandomLinkSplit(num_val=0.1, num_test=0.2, 
-                                    edge_types=[('user', 'rating', 'game')], rev_edge_types=[('game', 'rev_rating', 'user')])
-    train_data, val_data, test_data  = split_trans(data)
-
-    #weight = torch.bincount(train_data['user', 'game'].edge_attr)
-    #weight = weight.max() / weight
+    transform = T.RandomLinkSplit(is_undirected=True, edge_types=[('user', 'rating', 'game')], rev_edge_types=[('game', 'rev_rating', 'user')])
+    train_data, val_data, test_data = transform(data)
     
-    #def weighted_mse_loss(pred, target, weight=None):
-    #    weight = 1. if weight is None else weight[target].to(pred.dtype)
-    #    return (weight * (pred - target.to(pred.dtype)).pow(2)).mean()
+    edge_label_index = train_data['user', 'rating', 'game'].edge_index
+    edge_label = train_data['user', 'rating', 'game'].edge_label
+    train_loader = LinkNeighborLoader(train_data, num_neighbors=[6] * 3,  batch_size = batch_size, edge_label_index=(('user', 'rating', 'game'), edge_label_index), edge_label=edge_label)
+    val_loader = LinkNeighborLoader(val_data, num_neighbors=[6] * 3,  batch_size = batch_size, edge_label_index=(('user', 'rating', 'game'), edge_label_index), edge_label=edge_label)
 
-    train_loader = LinkNeighborLoader(train_data, num_neighbors=[8] * 2, batch_size = batch_size, neg_sampling_ratio=0.1, 
-                                    edge_label_index= train_data.edge_types[0])    
-    val_loader = LinkNeighborLoader(val_data, num_neighbors=[8] * 2, batch_size = batch_size, neg_sampling_ratio=0.1, 
-                                    edge_label_index= val_data.edge_types[0])
-    test_loader = LinkNeighborLoader(test_data, num_neighbors=[8] * 2, batch_size = batch_size, neg_sampling_ratio=0.1 , 
-                                    edge_label_index= test_data.edge_types[0])
-    
-    class GNNEncoder(torch.nn.Module):
-        def __init__(self, hidden_channels, out_channels):
-            super().__init__()
-            self.conv1 = SAGEConv((-1, -1), hidden_channels, project=True)
-            self.conv2 = SAGEConv((-1, -1), out_channels, project=True)
-
-        def forward(self, x, edge_index):
-            x = self.conv1(x, edge_index).relu()
-            x = self.conv2(x, edge_index)
-            return x    
-    
-    class EdgeDecoder(torch.nn.Module):
+    class GNN(torch.nn.Module):
         def __init__(self, hidden_channels):
             super().__init__()
-            self.lin1 = Linear(2 * hidden_channels, hidden_channels)
-            self.lin2 = Linear(hidden_channels, 1)
 
-        def forward(self, z_dict, edge_label_index):
-            row, col = edge_label_index
-            z = torch.cat([z_dict['user'][row], z_dict['game'][col]], dim=-1)
+            self.convs = torch.nn.ModuleList()
 
-            z = self.lin1(z).relu()
-            z = self.lin2(z)
-            return z.view(-1)
-    
+            self.num_layers = 3
+
+            self.convs.append(GraphConv((-1, -1), hidden_channels, aggr='mean'))
+            self.convs.append(GraphConv((-1, -1), hidden_channels, aggr='mean'))
+            self.convs.append(GraphConv((-1, -1), hidden_channels, aggr='mean'))
+
+
+    #TODO: make this part use the sparse tensors
+
+        def forward(self, x_dict, edge_index_dict, edge_weight_dict):
+            x = self.convs[0](x_dict, edge_index_dict, edge_weight_dict) 
+            x = F.relu(x)
+            x = F.dropout(x, p=0.5, training=self.training)
+            x = self.convs[1](x_dict, edge_index_dict, edge_weight_dict) 
+            x = F.relu(x)
+            x = F.dropout(x, p=0.5, training=self.training)
+            x = self.convs[2](x_dict, edge_index_dict, edge_weight_dict) 
+            return x
+
+    class Classifier(torch.nn.Module):
+        def forward(self, user_x, game_x, edge_label_index):
+            edge_feat_user = user_x[edge_label_index[0]]
+            edge_feat_game = game_x[edge_label_index[1]]    
+            return (edge_feat_user * edge_feat_game).sum(dim = -1)
+
     class Model(torch.nn.Module):
         def __init__(self, hidden_channels):
             super().__init__()
-            self.encoder = GNNEncoder(hidden_channels, hidden_channels)
-            self.encoder = to_hetero(self.encoder, data.metadata(), aggr='max')
-            self.decoder = EdgeDecoder(hidden_channels)
+            self.user_emb = torch.nn.Embedding(data['user'].num_nodes, hidden_channels)
+            self.game_emb = torch.nn.Embedding(data['game'].num_nodes, hidden_channels)  
 
-        def forward(self, x_dict, edge_index_dict, edge_label_index):
-            z_dict = self.encoder(x_dict, edge_index_dict)
-            return self.decoder(z_dict, edge_label_index)
-    
-    model = Model(hidden_channels=32)
+            self.gnn = GNN(hidden_channels)
+            self.gnn = to_hetero(self.gnn, metadata=data.metadata())
+            self.classifier = Classifier()
+        
+        def forward(self, data):
+            x_dict = {'user': self.user_emb(data['user'].node_id), 'game': self.game_emb(data['game'].node_id)}
+            x_dict = self.gnn(x_dict, data.edge_index_dict, {('user', 'rating', 'game'): data['user', 'rating', 'game'].edge_attr})
+            pred = self.classifier(x_dict['user'], x_dict['game'], data['user', 'rating', 'game'].edge_label_index)
+            return pred
+
+    hidden_channels = 32
+    model = Model(hidden_channels)
     print(model)
-    #model.to(device)    
-    
-    with torch.no_grad():
-        for batch in tqdm(train_loader):
-            #batch = batch.to(device)
-            model.encoder(batch.x_dict, batch.edge_index_dict)   
+    #model.to(device)      
 
-    optimizer = torch.optim.Adam(model.parameters(), lr = .0125)
+    optimizer = torch.optim.Adam(model.parameters(), lr = .005)
+
+    #TODO: lazy initialization by passing in one batch, look up lazy initialization
+    #TODO: can we do predictions on the edge weights themselves somehow, key= edge_attr at splitting?, have to get size right
 
     def train():
         model.train()
-        total_examples = total_loss = 0
-        for batch in tqdm(train_loader):
+        total_loss = total_examples = 0
+        pbar = tqdm(train_loader)
+        for batch in pbar:
             optimizer.zero_grad()
             #batch = batch.to(device)
-            batch_size = batch.batch_size
-            pred = model(batch.x_dict, batch.edge_index_dict, batch['user', 'game'].edge_label_index)
-            target = batch['user', 'game'].edge_label
-            loss = F.mse_loss(pred, target).sqrt()
+            #print(batch, ' is in pbar')
+            pred = model(batch)
+            ground_truth = batch['user', 'rating', 'game'].edge_label
+            #print(pred.shape)
+            ground_truth = ground_truth.float()
+            #print(ground_truth.shape)
+            #TODO: fix up this loss function? can use the index tensors to find the attr of the sampled edges, then pass in
+            loss = F.binary_cross_entropy_with_logits(pred, ground_truth)
             loss.backward()
             optimizer.step()
-            total_examples += batch_size
-            total_loss += float(loss) * batch_size
+            total_examples += pred.numel()
+            total_loss += float(loss) * pred.numel()
+            pbar.set_postfix({'loss': loss.item()})
+            
         return total_loss / total_examples
 
+    #TODO: The losses returned by train and test are scaled differently?
 
-    @torch.no_grad()
     def test(loader):
         model.eval()
         scores = []
-        for batch in tqdm(loader):
-            pred = model(batch.x_dict, batch.edge_index_dict, batch['user', 'game'].edge_label_index)
-            target = batch['user', 'game'].edge_label.float()
-            rmse = F.mse_loss(pred, target).sqrt()
-            scores.append(rmse)
+        with torch.no_grad():
+            with tqdm(loader) as tq:
+                for batch in tq:
+                    #batch.to(device)
+                    pred = model(batch)
+                    ground_truth = batch['user', 'rating', 'game'].edge_label
+                    rmse = F.binary_cross_entropy_with_logits(pred, ground_truth)
+                    scores.append(rmse)
+                    tq.set_postfix({'loss': rmse.item()})
         return np.average(scores)
 
     for epoch in range(1, 40):
+        print('Training...')
         loss = train()
-        train_rmse = test(train_loader)
+        #train_rmse = test(train_loader)
+        print('Validating...')
         val_rmse = test(val_loader)
-        test_rmse = test(test_loader)
-        print(f'Epoch: {epoch:03d}, Loss: {loss:.6f}, Train: {train_rmse:.6f}, 'f'Val: {val_rmse:.6f}, Test: {test_rmse:.6f}')
+        print(f'Epoch: {epoch:03d}, Loss: {loss:.6f}, 'f'Val: {val_rmse:.6f}')
 
-    torch.save(model.state_dict(), './model_8nbrs,2deep,10epochs,15kbatch.py')
+    torch.save(model.state_dict(), './model_6nbrs,3deep,40epochs,32kbatch,32hidden.py')
+
+    #TODO: model.compile()
+
+    #TODO: MAKE the edge decoder just a DOT PRODUCT or something that keeps LOCATIONS together!
 
 if __name__ == "__main__":
     main()

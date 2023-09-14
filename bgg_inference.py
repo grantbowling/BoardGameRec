@@ -5,16 +5,20 @@ from torch.nn import Linear
 import pandas as pd
 import csv
 
+import os
+import openai
+from dotenv import load_dotenv
+
 from torch_geometric.data import HeteroData
 import torch_geometric.transforms as T
-from torch_geometric.nn import SAGEConv, to_hetero
+from torch_geometric.nn import GraphConv, to_hetero
 
 def main():
     review_path = "./bgg-19m-reviews.csv"
     detailed_game_path = "./games_detailed_info.csv"
 
     def load_node_csv(path, index_col, encoders=None, **kwargs):
-        df = pd.read_csv(path, index_col=index_col, **kwargs)
+        df = pd.read_csv(path, index_col=index_col, low_memory=False, **kwargs)
         mapping = {index: i for i, index in enumerate(df.index.unique())}
 
         x = None
@@ -139,90 +143,118 @@ def main():
     data.edge_attr = torch.flatten(edge_attr)
 
     device = torch.device('mps')
-    batch_size = 15000
+    batch_size = 16
     data.batch_size = batch_size
-
-    #need to deal with this, use a small learnable embedding instead? id like to use mps with sparse matrices (not implemented)
-    #as hack use ones vector? 
-    #if use just eye its too big for gpu and cpu
-    #why doesnt cpu and sparse work?? weird error
-    #'NotImplementedError: Could not run 'aten::scatter_add.out' with arguments from the 'SparseCPU' backend.' but SparseCPU in list
-    #data['user'].x = torch.eye(data['user'].num_nodes) 
-    #data['user'].x = sparse_eye(data['user'].num_nodes) #try different sparse id matrix?
-    #data['user'].x = torch.nn.Embedding(len(user_mapping), 32)
-    
-    
-    data['user'].x = torch.unsqueeze(torch.ones(data['user'].num_nodes), dim=-1) #TODO: TRY APPLYING AFTER BATCHING
 
     data['user'].num_nodes = torch.tensor(len(user_mapping)) 
     data['game'].num_nodes = torch.tensor(len(game_mapping))
 
-    #data['user'].x_dict = {'user': torch.nn.Embedding(data['user'].num_nodes, dim_embd)}
-    #data.x_dict = torch.nn.ModuleDict({'user': torch.nn.Embedding(data['user'].num_nodes, dim_embd), 
-                                        #'game': torch.nn.Embedding(data['game'].num_nodes, dim_embd)})
-
-
     data.edge_types = [('user', 'rating', 'game')]
     data = T.ToUndirected()(data)
-    del data['game', 'rev_rating', 'user'].edge_label
-    del data['game', 'rev_rating', 'user'].edge_label_index
 
-    class GNNEncoder(torch.nn.Module):
-        def __init__(self, hidden_channels, out_channels):
-            super().__init__()
-            self.conv1 = SAGEConv((-1, -1), hidden_channels)
-            self.conv2 = SAGEConv((-1, -1), out_channels)
-
-        def forward(self, x, edge_index):
-            x = self.conv1(x, edge_index).relu()
-            x = self.conv2(x, edge_index)
-            return x    
-
-    class EdgeDecoder(torch.nn.Module):
+    class GNN(torch.nn.Module):
         def __init__(self, hidden_channels):
             super().__init__()
-            self.lin1 = Linear(2 * hidden_channels, hidden_channels)
-            self.lin2 = Linear(hidden_channels, 1)
 
-        def forward(self, z_dict, edge_label_index):
-            row, col = edge_label_index
-            z = torch.cat([z_dict['user'][row], z_dict['game'][col]], dim=-1)
+            self.convs = torch.nn.ModuleList()
 
-            z = self.lin1(z).relu()
-            z = self.lin2(z)
-            return z.view(-1)
-    
+            self.num_layers = 3
+
+            self.convs.append(GraphConv((-1, -1), hidden_channels, aggr='mean'))
+            self.convs.append(GraphConv((-1, -1), hidden_channels, aggr='mean'))
+            self.convs.append(GraphConv((-1, -1), hidden_channels, aggr='mean'))
+
+
+    #TODO: make this part use the sparse tensors
+
+        def forward(self, x_dict, edge_index_dict, edge_weight_dict):
+            x = self.convs[0](x_dict, edge_index_dict, edge_weight_dict) 
+            x = F.relu(x)
+            x = F.dropout(x, p=0.5, training=self.training)
+            x = self.convs[1](x_dict, edge_index_dict, edge_weight_dict) 
+            x = F.relu(x)
+            x = F.dropout(x, p=0.5, training=self.training)
+            x = self.convs[2](x_dict, edge_index_dict, edge_weight_dict) 
+            return x
+
+    class Classifier(torch.nn.Module):
+        def forward(self, user_x, game_x, edge_label_index):
+            edge_feat_user = user_x[edge_label_index[0]]
+            edge_feat_game = game_x[edge_label_index[1]]    
+            return (edge_feat_user * edge_feat_game).sum(dim = -1)
+
     class Model(torch.nn.Module):
         def __init__(self, hidden_channels):
             super().__init__()
-            self.encoder = GNNEncoder(hidden_channels, hidden_channels)
-            self.encoder = to_hetero(self.encoder, data.metadata(), aggr='max')
-            self.decoder = EdgeDecoder(hidden_channels)
+            self.user_emb = torch.nn.Embedding(data['user'].num_nodes, hidden_channels)
+            self.game_emb = torch.nn.Embedding(data['game'].num_nodes, hidden_channels)  
 
-        def forward(self, x_dict, edge_index_dict, edge_label_index):
-            z_dict = self.encoder(x_dict, edge_index_dict)
-            return self.decoder(z_dict, edge_label_index)
+            self.gnn = GNN(hidden_channels)
+            self.gnn = to_hetero(self.gnn, metadata=data.metadata())
+            self.classifier = Classifier()
+        
+        def forward(self, data):
+            x_dict = {'user': self.user_emb(data['user'].node_id), 'game': self.game_emb(data['game'].node_id)}
+            x_dict = self.gnn(x_dict, data.edge_index_dict, {('user', 'rating', 'game'): data['user', 'rating', 'game'].edge_attr})
+            pred = self.classifier(x_dict['user'], x_dict['game'], data['user', 'rating', 'game'].edge_label_index)
+            return pred
     
-    model = Model(16)
-    model.load_state_dict(torch.load('./model_8nbrs,2deep,10epochs.py'))
+    model = Model(hidden_channels=32)
+    model.load_state_dict(torch.load('./model_6nbrs,3deep,40epochs,32kbatch,32hidden.py'))
     model.eval()
-    print(model)
+    #print(model)
 
-    embeds = model.encoder(data.x_dict, data.edge_index_dict)
-    print(embeds)
-
-    #TODO: build a dictionary of primary name to index in the csv file, use this to look up the games entered by users
-    #then average the embeddings and do a nearest neighbor type search
-    #f = open('./games_names.csv', "r")
-    #print(f.readline())
+    embeds = data['game'].x
 
     names = pd.read_csv('./names.csv', encoding='utf8')
-    print(names)
-    
-    dist = torch.norm(embeds['game'] - embeds['game'][35], dim=1, p=None)
-    knn = dist.topk(6, largest=False)
-    print(knn)
+    names = names.drop(columns= names.columns[0])
+    dict_names = dict(names['primary'])
+    names_to_index = {name.lower() :index for (index, name) in dict_names.items()}
 
+    #TODO: compile recommendations and save at the end
+    load_dotenv()
+    openai.api_key = os.getenv('API_KEY')
+
+    print('Type \'Quit\' to exit and save your recommendations.')
+
+    def get_response(game):
+        return f'Write a short \'Board Game Geek\'-style description of a game with some thematic\
+            and mechanical elements of the game {game}. Make sure the game has a title.'
+
+    while True:
+        try:
+                
+            game_chosen = input('What game would you like to see similar games to?\n')
+            game_chosen_lower = game_chosen.lower()
+            if game_chosen_lower== 'quit':
+                break
+            game_chosen_index = names_to_index[game_chosen_lower]
+
+            dist = torch.norm(embeds - embeds[game_chosen_index], dim=1, p=None)
+            knn = dist.topk(11, largest=False) 
+            
+
+            print('Some games similar to ', game_chosen, 'are:\n') 
+            print([dict_names[nb.item()] for nb in knn[1][1:]])
+
+            ai_games = input('Would you like to see a similar game that does not exit?\n')
+            if ai_games.lower() == 'yes':
+                
+                response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "system", "content": 'You are a creative, skilled board game designer.'},
+                            {"role": "user", "content": get_response(game_chosen)}
+                ])
+
+                if response["choices"][0]["finish_reason"] == "stop":
+                    print(response["choices"][0]["message"]["content"])
+
+        except KeyError:
+            print('That was not a game I know. Check spelling and punctuation or try a different game next time.\n')
+
+#TODO: make it so the data is already premunged when I run inference
+#TODO: put the model somewhere where i can just import the custom classes
+#TODO: load sunmmary embeddings for nodes too?
 
 if __name__ == "__main__":
     main()
